@@ -23,6 +23,8 @@ use crate::{Error, Result};
 pub enum Message {
     /// Message of type "send"
     Send(MessageSend),
+    /// Message of type "rpc"
+    RpcSend(RpcMessageSend),
     /// Message of type "log"
     Log(MessageLog),
     /// Message of type "error"
@@ -35,6 +37,13 @@ pub enum Message {
 #[derive(Deserialize, Debug)]
 pub struct MessageSend {
     /// Payload of a Send Message.
+    pub payload: Value,
+}
+
+/// RPC Message Send.
+#[derive(Deserialize, Debug)]
+pub struct RpcMessageSend {
+    /// Payload of a RPC Message Send.
     pub payload: SendPayload,
 }
 
@@ -95,12 +104,14 @@ pub struct SendPayload {
 unsafe extern "C" fn call_on_message<I: ScriptHandler>(
     _script_ptr: *mut _FridaScript,
     message: *const i8,
-    _data: &frida_sys::_GBytes,
+    data: *mut frida_sys::GBytes,
     user_data: *mut c_void,
 ) {
-    let c_msg = CStr::from_ptr(message as *const c_char)
-        .to_str()
-        .unwrap_or_default();
+    let c_msg = unsafe {
+        CStr::from_ptr(message as *const c_char)
+            .to_str()
+            .unwrap_or_default()
+    };
 
     let formatted_msg: Message = serde_json::from_str(c_msg).unwrap_or_else(|err| {
         Message::Other(serde_json::json!({
@@ -108,17 +119,72 @@ unsafe extern "C" fn call_on_message<I: ScriptHandler>(
             "data": c_msg
         }))
     });
+    // let data_len = unsafe { frida_sys::g_bytes_get_size(data) };
+    // println!("Data length: {}", data_len);
+
+    let data_len = if !data.is_null() {
+        unsafe { frida_sys::g_bytes_get_size(data) }
+    } else {
+        0
+    };
+    println!("Data length: {}", data_len);
+    println!("converting data to Vec<u8>: {:?}", data);
+    let data = if !data.is_null() {
+        unsafe {
+            let size = frida_sys::g_bytes_get_size(data);
+            let data_ptr = frida_sys::g_bytes_get_data(data, std::ptr::null_mut()) as *const u8;
+
+            Some(std::slice::from_raw_parts(
+                data_ptr as *mut u8,
+                size as usize,
+            ))
+        }
+    } else {
+        None
+    };
 
     match formatted_msg {
         Message::Send(msg) => {
-            if msg.payload.r#type == "frida:rpc" {
-                let callback_handler: *mut CallbackHandler = user_data as _;
-                on_message(callback_handler.as_mut().unwrap(), Message::Send(msg));
+            // 如果 payload.type 为 "frida:rpc"，则调用 on_message 函数
+            if let Some(v) = msg.payload.as_object().map(|v| v.get("type")).flatten() {
+                if let Some(v) = v.as_str() {
+                    if v == "frida:rpc" {
+                        let callback_handler: *mut CallbackHandler = user_data as _;
+                        if let Ok(payload) = serde_json::from_value(msg.payload.clone()) {
+                            on_message(
+                                unsafe { callback_handler.as_mut().unwrap() },
+                                Message::RpcSend(RpcMessageSend { payload }),
+                            );
+                        } else {
+                            on_message(
+                                unsafe { callback_handler.as_mut().unwrap() },
+                                Message::Other(serde_json::json!({
+                                    "error": "Failed to parse payload",
+                                    "data": msg.payload
+                                })),
+                            );
+                        }
+
+                        return;
+                    }
+                }
             }
+
+            let handler: &mut I = unsafe { &mut *(user_data as *mut I) };
+
+            handler.on_message(&Message::Send(msg), data);
+
+            // if msg.payload.r#type == "frida:rpc" {
+            //     let callback_handler: *mut CallbackHandler = user_data as _;
+            //     on_message(
+            //         unsafe { callback_handler.as_mut().unwrap() },
+            //         Message::Send(msg),
+            //     );
+            // }
         }
         _ => {
-            let handler: &mut I = &mut *(user_data as *mut I);
-            handler.on_message(&formatted_msg);
+            let handler: &mut I = unsafe { &mut *(user_data as *mut I) };
+            handler.on_message(&formatted_msg, data);
         }
     }
 }
@@ -131,7 +197,7 @@ fn on_message(cb_handler: &mut CallbackHandler, message: Message) {
 /// Represents a script signal handler.
 pub trait ScriptHandler {
     /// Handler called when a message is shared from JavaScript to Rust.
-    fn on_message(&mut self, message: &Message);
+    fn on_message(&mut self, message: &Message, data: Option<&[u8]>);
 }
 
 /// Represents a Frida script.
@@ -287,7 +353,7 @@ impl<'a> Script<'a> {
         let rpc_result = rx.recv().unwrap();
 
         let func_list: Vec<String> = match rpc_result {
-            Message::Send(r) => {
+            Message::RpcSend(r) => {
                 let tmp_list: Vec<String> = r
                     .payload
                     .returns
@@ -338,7 +404,7 @@ impl<'a> Exports<'a> {
         let rpc_result = rx.recv().unwrap();
 
         match rpc_result {
-            Message::Send(r) => {
+            Message::RpcSend(r) => {
                 if r.payload.result == "ok" {
                     let returns = r.payload.returns;
 

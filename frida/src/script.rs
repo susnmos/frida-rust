@@ -119,16 +119,7 @@ unsafe extern "C" fn call_on_message<I: ScriptHandler>(
             "data": c_msg
         }))
     });
-    // let data_len = unsafe { frida_sys::g_bytes_get_size(data) };
-    // println!("Data length: {}", data_len);
 
-    let data_len = if !data.is_null() {
-        unsafe { frida_sys::g_bytes_get_size(data) }
-    } else {
-        0
-    };
-    println!("Data length: {}", data_len);
-    println!("converting data to Vec<u8>: {:?}", data);
     let data = if !data.is_null() {
         unsafe {
             let size = frida_sys::g_bytes_get_size(data);
